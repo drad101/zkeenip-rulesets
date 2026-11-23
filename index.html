@@ -1,0 +1,304 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Mihomo — zkeenip</title>
+<style>
+  body { max-width: 850px; margin: 32px auto; padding: 0 16px; font: 16px system-ui, sans-serif; color:#202331; background:#f5f6fa }
+  main { background:white; padding:24px; border-radius:14px; box-shadow:0 4px 24px #17204412 }
+  h1 { margin-top:0 } textarea,input,button { font:inherit; box-sizing:border-box }
+  textarea,input { width:100%; padding:12px; border:1px solid #c8ccda; border-radius:8px; margin:8px 0 16px }
+  textarea { min-height:150px; resize:vertical }
+  button { padding:11px 16px; border:0; border-radius:8px; background:#5548d9; color:white; cursor:pointer }
+  button:disabled { opacity:.5; cursor:wait }
+  #status { white-space:pre-wrap; margin-top:16px }
+  .hint { color:#596176; font-size:14px }
+</style>
+</head>
+<body>
+<main>
+  <h1>Mihomo — zkeenip</h1>
+  <p>Вставь ссылку на подписку или её содержимое. Поддерживаются VLESS, VMess, Trojan и Shadowsocks.</p>
+  <label for="source">Ссылка или содержимое подписки</label>
+  <textarea id="source" placeholder="https://… или vless://…&#10;Можно вставить несколько ссылок"></textarea>
+  <button id="generate">Сгенерировать и скачать YAML</button>
+  <div id="status" role="status"></div>
+  <p class="hint">Обработка выполняется в браузере. При загрузке по ссылке браузер может отказать из-за CORS — тогда вставь содержимое подписки в поле.</p>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const status = message => { $("status").textContent = message; };
+
+function decodeBase64(text) {
+  const normalized = text.replace(/-/g, "+").replace(/_/g, "/");
+  const binary = atob(normalized);
+  const bytes = Uint8Array.from(binary, c => c.charCodeAt(0));
+  return new TextDecoder().decode(bytes);
+}
+
+function maybeDecodeSubscription(text) {
+  const trimmed = text.trim();
+  if (/^(vless|vmess|trojan|ss):\/\//mi.test(trimmed)) return trimmed;
+  try {
+    const decoded = decodeBase64(trimmed);
+    if (/^(vless|vmess|trojan|ss):\/\//mi.test(decoded.trim())) return decoded;
+  } catch {}
+  return trimmed;
+}
+
+function safeName(value, fallback) {
+  return (value || fallback).replace(/[\r\n]/g, "").trim();
+}
+function q(value) { return JSON.stringify(String(value)); }
+function yamlNode(node) {
+  const lines = [`  - name: ${q(node.name)}`, `    type: ${node.type}`, `    server: ${q(node.server)}`, `    port: ${Number(node.port)}`];
+  for (const [key, value] of Object.entries(node.options)) {
+    if (value === undefined || value === null || value === "") continue;
+    if (typeof value === "boolean" || typeof value === "number") lines.push(`    ${key}: ${value}`);
+    else lines.push(`    ${key}: ${q(value)}`);
+  }
+  return lines.join("\n");
+}
+function parseLink(line, index) {
+  line = line.trim();
+  if (!line || line.startsWith("#")) return null;
+
+  if (line.startsWith("vmess://")) {
+    const raw = decodeBase64(line.slice(8));
+    const v = JSON.parse(raw);
+    const options = {
+      cipher: v.scy || "auto",
+      uuid: v.id,
+      alterId: Number(v.aid || 0),
+      network: v.net || "tcp",
+      udp: true
+    };
+    if (v.tls === "tls") {
+      options.tls = true;
+      options.servername = v.sni || v.host || undefined;
+      options["skip-cert-verify"] = false;
+    }
+    if ((v.net || "").toLowerCase() === "ws") {
+      options["ws-opts"] = undefined;
+    }
+    const extra = [];
+    if ((v.net || "").toLowerCase() === "ws") {
+      extra.push(`    ws-opts:\n      path: ${q(v.path || "/")}`);
+      if (v.host) extra.push(`      headers:\n        Host: ${q(v.host)}`);
+    }
+    return {
+      name: safeName(decodeURIComponent(v.ps || ""), `Server ${index}`),
+      type: "vmess", server: v.add, port: v.port, options, extra
+    };
+  }
+
+  if (/^(vless|trojan|ss):\/\//.test(line)) {
+    const u = new URL(line);
+    const name = safeName(decodeURIComponent(u.hash.slice(1)), `Server ${index}`);
+    const server = u.hostname;
+    const port = u.port;
+    const p = Object.fromEntries(u.searchParams.entries());
+
+    if (u.protocol === "vless:") {
+      const options = {
+        uuid: decodeURIComponent(u.username),
+        network: p.type || "tcp",
+        udp: true
+      };
+      if (p.security === "tls" || p.security === "reality") {
+        options.tls = true;
+        options.servername = p.sni || undefined;
+        options["client-fingerprint"] = p.fp || undefined;
+      }
+      if (p.security === "reality") {
+        options["reality-opts"] = { "public-key": p.pbk, "short-id": p.sid || "" };
+      }
+      if (p.flow) options.flow = p.flow;
+      const extra = [];
+      if (p.type === "ws") {
+        extra.push(`    ws-opts:\n      path: ${q(p.path || "/")}`);
+        if (p.host) extra.push(`      headers:\n        Host: ${q(p.host)}`);
+      }
+      return { name, type:"vless", server, port, options, extra };
+    }
+
+    if (u.protocol === "trojan:") {
+      return {
+        name, type:"trojan", server, port,
+        options: {
+          password: decodeURIComponent(u.username),
+          sni: p.sni || undefined,
+          network: p.type === "ws" ? "ws" : undefined,
+          udp: true,
+          "skip-cert-verify": false
+        },
+        extra: p.type === "ws" ? [`    ws-opts:\n      path: ${q(p.path || "/")}`] : []
+      };
+    }
+
+    // Shadowsocks URI: ss://base64(method:password)@host:port
+    let method, password;
+    if (u.username.includes(":")) {
+      method = decodeURIComponent(u.username);
+      password = decodeURIComponent(u.password);
+    } else {
+      const decoded = decodeBase64(decodeURIComponent(u.username));
+      const split = decoded.indexOf(":");
+      if (split < 0) throw new Error("Не удалось прочитать метод/пароль SS");
+      method = decoded.slice(0, split);
+      password = decoded.slice(split + 1);
+    }
+    return { name, type:"ss", server, port, options:{ cipher:method, password, udp:true }, extra:[] };
+  }
+
+  return null;
+}
+
+function makeConfig(nodes) {
+  const proxyNames = nodes.map(n => q(n.name)).join(", ");
+  const yamlNodes = nodes.map(yamlNode).join("\n");
+  const extras = nodes.flatMap(n => n.extra || []).join("\n");
+
+  return `# Создано локально в браузере. Проверь конфиг командой: mihomo -t -f config.yaml
+log-level: silent
+allow-lan: true
+redir-port: 5000
+tproxy-port: 5001
+routing-mark: 255
+find-process-mode: off
+unified-delay: true
+external-controller: 0.0.0.0:9090
+external-ui: zashboard
+external-ui-url: https://github.com/Zephyruso/zashboard/releases/latest/download/dist.zip
+
+proxies:
+${yamlNodes}${extras ? "\n" + extras : ""}
+
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies: [Manual, Fallback, Auto-Best]
+
+  - name: Manual
+    type: select
+    proxies: [${proxyNames}]
+
+  - name: Fallback
+    type: fallback
+    url: https://www.gstatic.com/generate_204
+    interval: 300
+    max-failed-times: 3
+    proxies: [${proxyNames}]
+
+  - name: Auto-Best
+    type: url-test
+    url: https://www.gstatic.com/generate_204
+    interval: 300
+    max-failed-times: 3
+    proxies: [${proxyNames}]
+
+rule-providers:
+  torrent-trackers@domain:
+    type: http
+    format: mrs
+    behavior: domain
+    interval: 86400
+    url: https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/category-public-tracker.mrs
+  torrent-pt@domain:
+    type: http
+    format: mrs
+    behavior: domain
+    interval: 86400
+    url: https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/category-pt.mrs
+  category-ru@ipcidr:
+    type: http
+    format: mrs
+    behavior: ipcidr
+    interval: 86400
+    url: https://github.com/drad101/zkeenip-rulesets/releases/latest/download/ru@ipcidr.mrs
+  category-ip-geo-detect@domain:
+    type: http
+    format: mrs
+    behavior: domain
+    interval: 86400
+    url: https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/category-ip-geo-detect.mrs
+  cloudflare@ipcidr:
+    type: http
+    format: mrs
+    behavior: ipcidr
+    interval: 86400
+    url: https://github.com/drad101/zkeenip-rulesets/releases/latest/download/cloudflare@ipcidr.mrs
+  google@ipcidr:
+    type: http
+    format: mrs
+    behavior: ipcidr
+    interval: 86400
+    url: https://github.com/drad101/zkeenip-rulesets/releases/latest/download/google@ipcidr.mrs
+  telegram@ipcidr:
+    type: http
+    format: mrs
+    behavior: ipcidr
+    interval: 86400
+    url: https://github.com/drad101/zkeenip-rulesets/releases/latest/download/telegram@ipcidr.mrs
+
+rules:
+  - RULE-SET,torrent-trackers@domain,DIRECT
+  - RULE-SET,torrent-pt@domain,DIRECT
+  - RULE-SET,category-ip-geo-detect@domain,PROXY
+  - RULE-SET,category-ru@ipcidr,DIRECT
+  - MATCH,PROXY
+`;
+}
+
+$("generate").addEventListener("click", async () => {
+  const button = $("generate");
+  button.disabled = true;
+  status("Читаю подписку…");
+  try {
+    let input = $("source").value.trim();
+    if (!input) throw new Error("Вставь ссылку или содержимое подписки.");
+
+    if (/^https?:\/\//i.test(input)) {
+      const response = await fetch(input);
+      if (!response.ok) throw new Error(`Ссылка вернула HTTP ${response.status}.`);
+      input = await response.text();
+    }
+
+    input = maybeDecodeSubscription(input);
+    const lines = input.split(/\r?\n/);
+    const nodes = [];
+    const errors = [];
+
+    for (const line of lines) {
+      try {
+        const node = parseLink(line, nodes.length + 1);
+        if (node) nodes.push(node);
+      } catch (e) {
+        errors.push(e.message);
+      }
+    }
+
+    if (!nodes.length) {
+      throw new Error("Не нашёл поддерживаемых серверов. Проверь формат подписки.");
+    }
+
+    const blob = new Blob([makeConfig(nodes)], {type:"text/yaml;charset=utf-8"});
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "config.yaml";
+    a.click();
+    URL.revokeObjectURL(a.href);
+
+    status(`Готово: серверов найдено — ${nodes.length}.` +
+      (errors.length ? `\nНекоторые строки пропущены: ${errors.length}.` : ""));
+  } catch (e) {
+    status(`Не получилось: ${e.message}\nЕсли это ошибка CORS, вставь содержимое подписки в поле.`);
+  } finally {
+    button.disabled = false;
+  }
+});
+</script>
+</body>
+</html>
